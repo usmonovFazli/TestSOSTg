@@ -1,180 +1,219 @@
+import os
 import json
 import logging
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import CommandStart
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-import asyncio
-import os
-TOKEN = os.getenv("TOKEN")
+from aiogram import F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Router
 
+logging.basicConfig(level=logging.INFO)
 
-bot = Bot(
-    token=TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+# -------------------------
+#  TOKEN
+# -------------------------
+TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+rt = Router()
+dp.include_router(rt)
 
-dp = Dispatcher()
-
-# 🔹 Загружаем структуру регионов из файла
+# -------------------------
+#  ЗАГРУЗКА РЕГИОНОВ
+# -------------------------
 with open("mapping.json", "r", encoding="utf-8") as f:
     REGION_MAP = json.load(f)
 
-# 🔹 Временное хранилище (нет БД)
+# -------------------------
+#  FSM
+# -------------------------
+class Form(StatesGroup):
+    region = State()
+    district = State()
+    village = State()
+    content = State()
+
+# Временное хранилище вложений
 user_data = {}
 
-# --------------------- ХЭНДЛЕРЫ ----------------------
+# -------------------------
+#  КНОПКИ
+# -------------------------
 
-@dp.message(CommandStart())
-async def start(message: types.Message):
-    kb = ReplyKeyboardBuilder()
-    for region in REGION_MAP.keys():
-        kb.button(text=region)
-    kb.adjust(2)
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📨 Отправить обращение")],
+    ],
+    resize_keyboard=True
+)
 
+def make_kb(items):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=item)] for item in items],
+        resize_keyboard=True
+    )
+
+# -------------------------
+#  START
+# -------------------------
+@rt.message(Command("start"))
+async def start_cmd(message: types.Message):
     user_data[message.from_user.id] = {}
+    await message.answer("Выберите область:", reply_markup=make_kb(list(REGION_MAP.keys())))
+    await dp.fsm.set_state(message.from_user.id, Form.region)
 
-    await message.answer(
-        "👋 Привет! Этот бот помогает связаться с участковым.\n\n"
-        "Выберите область:",
-        reply_markup=kb.as_markup(resize_keyboard=True)
-    )
-
-
-@dp.message(F.text.in_(list(REGION_MAP.keys())))
-async def select_region(message: types.Message):
+# -------------------------
+#  ВЫБОР ОБЛАСТИ
+# -------------------------
+@rt.message(Form.region)
+async def choose_region(message: types.Message, state: FSMContext):
     region = message.text
-    user_data[message.from_user.id]["region"] = region
+    if region not in REGION_MAP:
+        return await message.answer("Неверная область, попробуйте снова.")
 
-    kb = ReplyKeyboardBuilder()
-    for city in REGION_MAP[region].keys():
-        kb.button(text=city)
-    kb.adjust(2)
+    user_data[message.from_user.id] = {"region": region}
+    await state.set_state(Form.district)
+    await message.answer("Теперь выберите район:", reply_markup=make_kb(list(REGION_MAP[region].keys())))
 
+# -------------------------
+#  ВЫБОР РАЙОНА
+# -------------------------
+@rt.message(Form.district)
+async def choose_district(message: types.Message, state: FSMContext):
+    region = user_data[message.from_user.id]["region"]
+    district = message.text
+
+    if district not in REGION_MAP[region]:
+        return await message.answer("Неверный район, попробуйте снова.")
+
+    user_data[message.from_user.id]["district"] = district
+    villages = REGION_MAP[region][district]
+
+    await state.set_state(Form.village)
+    await message.answer("Выберите махаллю:", reply_markup=make_kb(villages))
+
+# -------------------------
+#  ВЫБОР МАХАЛЛИ
+# -------------------------
+@rt.message(Form.village)
+async def choose_village(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    region = user_data[uid]["region"]
+    district = user_data[uid]["district"]
+    village = message.text
+
+    if village not in REGION_MAP[region][district]:
+        return await message.answer("Неверная махалля, попробуйте снова.")
+
+    user_data[uid]["village"] = village
+    user_data[uid]["attachments"] = []
+
+    await state.set_state(Form.content)
     await message.answer(
-        f"🏙️ Область <b>{region}</b> выбрана.\nТеперь выберите город:",
-        reply_markup=kb.as_markup(resize_keyboard=True)
+        "Отправьте текст, фото, видео, голосовое или локацию.\n"
+        "Когда будете готовы — нажмите «Отправить».",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отправить")]],
+            resize_keyboard=True
+        )
     )
 
-
-@dp.message()
-async def select_city_or_mahalla(message: types.Message):
+# -------------------------
+#  СБОР ВЛОЖЕНИЙ
+# -------------------------
+@rt.message(Form.content)
+async def collect_content(message: types.Message, state: FSMContext):
     uid = message.from_user.id
 
-    if uid not in user_data or "region" not in user_data[uid]:
-        return await message.answer("Сначала нажмите /start")
-
-    region = user_data[uid]["region"]
-
-    # Выбор города
-    if message.text in REGION_MAP[region].keys():
-        city = message.text
-        user_data[uid]["city"] = city
-
-        kb = ReplyKeyboardBuilder()
-        for mahalla in REGION_MAP[region][city].keys():
-            kb.button(text=mahalla)
-        kb.adjust(2)
-
-        await message.answer(
-            f"🌆 Город <b>{city}</b> выбран.\nТеперь выберите махаллю:",
-            reply_markup=kb.as_markup(resize_keyboard=True)
-        )
-        return
-
-    # Проверка, выбран ли город
-    city = user_data[uid].get("city")
-    if not city:
-        return await message.answer("Сначала выберите город.")
-
-    # Выбор махалли
-    if message.text in REGION_MAP[region][city].keys():
-        mahalla = message.text
-        user_data[uid]["mahalla"] = mahalla
-        user_data[uid]["attachments"] = []
-
-        await message.answer(
-            f"🏘️ Махалля <b>{mahalla}</b> выбрана.\n"
-            "Теперь отправьте текст, фото или локацию.\n"
-            "Когда будете готовы — нажмите <b>Отправить</b>",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Отправить")]],
-                resize_keyboard=True
-            )
-        )
-        return
-
-    # Отправка данных участковому
+    # Если нажато "Отправить"
     if message.text == "Отправить":
-        mahalla = user_data[uid].get("mahalla")
-        if not mahalla:
-            return await message.answer("Сначала выберите махаллю.")
-
-        chat_id = REGION_MAP[region][city][mahalla]  # ID участкового
-        attachments = user_data[uid].get("attachments", [])
+        attachments = user_data[uid]["attachments"]
 
         if not attachments:
-            return await message.answer("Вы не отправили ни текст, ни фото, ни локацию.")
+            return await message.answer("Вы не отправили ни текста, ни медиа.")
 
-        # Заголовок сообщения участковому
-        await bot.send_message(
-            chat_id,
-            f"📩 Новое сообщение от гражданина:\n\n"
-            f"🌍 Область: {region}\n"
-            f"🏙️ Город: {city}\n"
-            f"🏘️ Махалля: {mahalla}\n"
-            f"👤 Пользователь: @{message.from_user.username or 'аноним'}"
+        region = user_data[uid]["region"]
+        district = user_data[uid]["district"]
+        village = user_data[uid]["village"]
+
+        summary = (
+            f"Новое обращение:\n\n"
+            f"📍 Область: {region}\n"
+            f"📍 Район: {district}\n"
+            f"📍 Махалля: {village}\n\n"
+            f"Вложения: {len(attachments)} шт."
         )
 
-        # Отправляем вложения
-        for item in attachments:
-            if item["type"] == "text":
-                await bot.send_message(chat_id, item["data"])
-            elif item["type"] == "photo":
-                await bot.send_photo(chat_id, item["data"])
-            elif item["type"] == "location":
-                await bot.send_location(chat_id, item["lat"], item["lon"])
+        await message.answer(summary)
 
-        await message.answer(
-            "✅ Сообщение успешно отправлено участковому!",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
+        # Отправляем назад пользователю (чтобы убедился, что всё собрано)
+        for att in attachments:
+            if att["type"] == "text":
+                await message.answer(att["data"])
+            elif att["type"] == "photo":
+                await message.answer_photo(att["data"])
+            elif att["type"] == "video":
+                await message.answer_video(att["data"])
+            elif att["type"] == "voice":
+                await message.answer_voice(att["data"])
+            elif att["type"] == "location":
+                await message.answer_location(att["lat"], att["lon"])
 
-        del user_data[uid]
-        return
+        await state.clear()
+        return await message.answer("Готово!", reply_markup=main_kb)
 
-    # Добавление вложений
+    # ---- ТЕКСТ ----
+    if message.text and message.text != "Отправить":
+        user_data[uid]["attachments"].append({
+            "type": "text",
+            "data": message.text
+        })
+        return await message.answer("Текст добавлен.")
+
+    # ---- ФОТО ----
     if message.photo:
         user_data[uid]["attachments"].append({
             "type": "photo",
             "data": message.photo[-1].file_id
         })
-        return await message.answer("📷 Фото добавлено!")
+        return await message.answer("Фото добавлено.")
 
+    # ---- ВИДЕО ----
+    if message.video:
+        user_data[uid]["attachments"].append({
+            "type": "video",
+            "data": message.video.file_id
+        })
+        return await message.answer("Видео добавлено.")
+
+    # ---- ГОЛОСОВЫЕ ----
+    if message.voice:
+        user_data[uid]["attachments"].append({
+            "type": "voice",
+            "data": message.voice.file_id
+        })
+        return await message.answer("Голосовое сообщение добавлено.")
+
+    # ---- ЛОКАЦИЯ ----
     if message.location:
         user_data[uid]["attachments"].append({
             "type": "location",
             "lat": message.location.latitude,
             "lon": message.location.longitude
         })
-        return await message.answer("📍 Локация добавлена!")
+        return await message.answer("Локация добавлена.")
 
-    # Обычный текст
-    user_data[uid]["attachments"].append({
-        "type": "text",
-        "data": message.text
-    })
-    await message.answer("📝 Текст добавлен.")
+    await message.answer("Этот тип сообщения не поддерживается.")
 
-
-# --------------------- ЗАПУСК ----------------------
-
+# -------------------------
+#  ЗАПУСК БОТА
+# -------------------------
 async def main():
-    logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
